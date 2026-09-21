@@ -1,0 +1,9 @@
+build/
+dist/
+*.spec.bak
+__pycache__/
+*.pyc
+*.log
+cookies.txt
+*.tmp
+.env
