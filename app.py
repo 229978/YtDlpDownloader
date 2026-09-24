@@ -4,21 +4,21 @@
 全平台视频下载器 · yt-dlp GUI
 =============================================================================
 
-一个基于 tkinter / ttk 的深色主题图形外壳：通过系统 PATH 调用外部已安装的
-yt-dlp 与 ffmpeg 完成下载。凡是 yt-dlp 支持的站点（B 站、抖音、小红书、
-YouTube、Twitter/X、Vimeo、Twitch、微博……）本工具都可以直接使用。
+一个基于 tkinter / ttk 的浅色主题图形外壳：调用外部的 yt-dlp 与 ffmpeg 完成下载。
+凡是 yt-dlp 支持的站点（B 站、抖音、小红书、YouTube、Twitter/X、Vimeo、
+Twitch、微博……）本工具都可以直接使用。
 
 设计定位
 --------
 本程序是「命令行拼装 + 子进程托管 + 日志回显」的薄外壳，不内嵌下载引擎：
 
-    * 下载引擎：系统 PATH 中的 yt-dlp
-    * 音视频合并：系统 PATH 中的 ffmpeg（yt-dlp 自动调用）
+    * 下载引擎：优先使用程序目录下的便携版 yt-dlp(.exe)，没有则回退系统 PATH
+    * 音视频合并：同上，优先程序目录下的 ffmpeg(.exe)，再回退系统 PATH
 
 界面与交互
 ----------
-    * 深色主题：炭黑/深灰底 + 浅灰白文字 + 低饱和蓝强调色
-    * 小圆角（3px，偏向直角）、扁平纯色填充、1px 细边框
+    * 浅色现代主题：#FAFAFA 底 + #FFFFFF 卡片 + #E5E7EB 细边框 + #2563EB 强调蓝
+    * 适度圆角（6px）、扁平纯色填充、1px 细边框，聚焦时蓝色高亮描边
     * 布局参考 Windows 10 系统设置：分组卡片、控件对齐、留白适中
     * 按钮仅在悬浮时轻微高亮；窗口标题栏保持系统原生，只美化内容区
 
@@ -52,11 +52,23 @@ YouTube、Twitter/X、Vimeo、Twitch、微博……）本工具都可以直接�
        两个按钮会按当前状态自动灰显，不需要额外文字说明
     10. 支持把链接作为启动参数传入：YtDlpDownloader.exe "https://..."（也可直接把
         链接拖到 exe 图标上），打开后回车即可开始下载
+    11. 便携二进制优先：程序目录下放 yt-dlp.exe / ffmpeg.exe 即自动优先使用，
+        环境自检会标注【本地便携版】还是【系统PATH版本】
+    12. 缺失依赖引导：点下载时若缺 yt-dlp / ffmpeg，弹窗给出可一键复制的 winget
+        安装命令，装完重启本程序即可
+    13. 可折叠「高级选项」卡片（默认收起）：代理地址、自定义附加参数、下载字幕、
+        限速，以及一键重置；展开状态与各项取值都会记忆到配置文件
+    14. 引擎版本：启动时后台执行 yt-dlp --version，把版本号和二进制来源显示在
+        状态区域（区分便携版 / 系统 PATH 版）
 
 关键实现
 --------
     * 默认基础参数：-f "bv*+ba" --add-header Referer:https://www.bilibili.com
       （「清晰度」选最高画质时输出与原始需求完全一致）
+    * 二进制解析：resolve_binaries() 在启动时决定 YTDLP_BIN / FFMPEG_BIN
+      （便携版取绝对路径，PATH 版保留裸命令名，便于命令预览保持简洁）
+    * 配置文件：新增配置项一律"读旧 -> 合并 -> 写回"，不会覆盖或丢弃旧字段，
+      完全兼容只含 default_output_dir 的老版本配置
     * 清晰度映射：其他档位用 bv*[height<=N]+ba/b[height<=N]/b，
       即"不高于 N 分辨率"优先，并逐级兜底，避免站点缺档位时报格式不可用
     * 合集开关：勾选 = 纯净（不加参数）；取消 = 追加 --no-playlist
@@ -79,6 +91,9 @@ YouTube、Twitter/X、Vimeo、Twitch、微博……）本工具都可以直接�
     * tcl/tk 运行时（tcl86t.dll / tk86t.dll / tcl 库目录）由 PyInstaller 自带的
       hook-tkinter 自动收集，这里再显式声明 tkinter 子模块与数据，双重兜底，
       避免打包后 GUI 因缺资源而启动失败。
+    * [新增] 两种模式都支持，参数完全一致：把 --onefile 换成 --onedir 即可得到
+      免解压启动的目录版（便携二进制 yt-dlp.exe / ffmpeg.exe 放在 exe 同目录
+      依然会被优先识别）。
 """
 
 import json
@@ -86,6 +101,7 @@ import locale
 import os
 import queue
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -100,33 +116,55 @@ from tkinter import filedialog, messagebox, ttk
 # ===========================================================================
 
 APP_TITLE = "全平台视频下载器 · yt-dlp GUI"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 
-# 外部依赖的可执行文件名（均由用户在系统层面安装并配置进 PATH）
+# 外部依赖的可执行文件名
+#   [新增] 这两个全局量改为"运行时动态赋值"：启动时由 resolve_binaries()
+#   按「程序目录便携版优先 → 系统 PATH 回退」的规则重新赋值。
+#   这里保留同名默认值，保证任何提前引用它们的代码路径仍然安全可用。
 YTDLP_BIN = "yt-dlp"
 FFMPEG_BIN = "ffmpeg"
+# [新增] 二进制来源标记，用于环境自检和状态区展示
+SOURCE_LOCAL = "本地便携版"
+SOURCE_PATH = "系统PATH版本"
+YTDLP_SOURCE = ""          # 运行时赋值：SOURCE_LOCAL / SOURCE_PATH / ""
+FFMPEG_SOURCE = ""
+YTDLP_RESOLVED_PATH = ""   # 运行时赋值：实际解析到的完整路径
+FFMPEG_RESOLVED_PATH = ""
+YTDLP_VERSION = ""         # [新增] 运行时赋值：yt-dlp --version 的结果
 
-# ---- 深色主题配色：炭黑 / 深灰底 + 浅灰白文字 + 低饱和蓝强调 ----
+# ---- [新增] 浅色现代主题配色 ----
+#   主背景 #FAFAFA / 卡片 #FFFFFF / 边框 #E5E7EB / 主文字 #1F2937 / 次要文字 #6B7280
+#   按钮主色 #2563EB / hover #1D4ED8 / 成功 #10B981 / 警告 #F59E0B / 错误 #EF4444
 C = {
-    "BG":          "#1f1f1f",   # 窗口底色（炭黑）
-    "SURFACE":     "#2a2a2a",   # 分组卡片底色（深灰）
-    "INPUT_BG":    "#1b1b1b",   # 输入框 / 终端底色
-    "BORDER":      "#3a3a3a",   # 1px 细边框
-    "TEXT":        "#e6e6e6",   # 主文字（浅灰白）
-    "TEXT_DIM":    "#9a9a9a",   # 次要文字
-    "TEXT_MUTE":   "#7d7d7d",   # 更弱的提示文字
-    "ACCENT":      "#3f6f9f",   # 强调色（低饱和蓝）
-    "ACCENT_HI":   "#4c83b8",   # 悬浮高亮
-    "ACCENT_LO":   "#33587d",   # 按下
-    "GHOST_BG":    "#333333",   # 次级按钮填充
-    "GHOST_HI":    "#3f3f3f",
-    "DISABLED_BG": "#2e3236",
-    "DISABLED_FG": "#6b7075",
-    "OK":          "#7fae7f",
-    "ERR":         "#d07b7b",
-    "WARN":        "#d0b070",
-    "CMD_FG":      "#cfe3f5",
-    "LOG_FG":      "#d6d6d6",
+    "BG":          "#FAFAFA",   # 窗口底色
+    "SURFACE":     "#FFFFFF",   # 分组卡片底色
+    "INPUT_BG":    "#FFFFFF",   # 输入框 / 下拉框底色
+    "BORDER":      "#E5E7EB",   # 1px 细边框
+    "TEXT":        "#1F2937",   # 主文字
+    "TEXT_DIM":    "#6B7280",   # 次要文字
+    "TEXT_MUTE":   "#9CA3AF",   # 更弱的提示文字
+    "ACCENT":      "#2563EB",   # 强调色（按钮主色）
+    "ACCENT_HI":   "#1D4ED8",   # 悬浮高亮
+    "ACCENT_LO":   "#1E40AF",   # 按下
+    "GHOST_BG":    "#F3F4F6",   # 次级按钮填充
+    "GHOST_HI":    "#E5E7EB",
+    "DISABLED_BG": "#E5E7EB",
+    "DISABLED_FG": "#9CA3AF",
+    "OK":          "#10B981",   # 成功
+    "ERR":         "#EF4444",   # 错误
+    "WARN":        "#F59E0B",   # 警告 / 提示
+    "CMD_FG":      "#0F172A",   # 命令预览文字（浅色代码风格）
+    "LOG_FG":      "#374151",   # 日志文字
+    # [新增] 浅色主题下新增的专用色
+    "LOG_BG":      "#F3F4F6",   # 日志区域底色（需求指定）
+    "CMD_BG":      "#F6F8FA",   # 命令预览框：浅色代码风格底色
+    "BORDER_HI":   "#D1D5DB",   # 悬浮时的边框
+    "GHOST_LO":    "#D1D5DB",   # 次级按钮按下
+    "TROUGH":      "#E5E7EB",   # 进度条槽 / 滚动条槽
+    "SCROLL_BG":   "#D1D5DB",   # 滚动条滑块
+    "SCROLL_HI":   "#9CA3AF",   # 滚动条滑块悬浮
+    "GHOST_FG":    "#374151",   # [新增] 次级按钮文字色
 }
 
 # ---- yt-dlp 参数 ----
@@ -164,6 +202,45 @@ OUTPUT_TEMPLATE = "%(title)s.%(ext)s"
 #   {"default_output_dir": "D:\\Videos"}
 # 内置默认保存位置仍然是：源码运行 = 脚本所在目录，exe 运行 = exe 所在目录
 CONFIG_NAME = "ytdlp-gui.config.json"
+
+# ---- [新增] 便携二进制文件名（放在程序目录里即被优先使用）----
+PORTABLE_YTDLP_NAMES = ["yt-dlp.exe", "yt-dlp"]
+PORTABLE_FFMPEG_NAMES = ["ffmpeg.exe", "ffmpeg"]
+
+# ---- [新增] 配置文件里新增的键名（老配置没有这些键时按默认值走）----
+CFG_DEFAULT_DIR = "default_output_dir"
+CFG_ADV_EXPANDED = "advanced_expanded"
+CFG_ADV_PROXY = "advanced_proxy"
+CFG_ADV_CUSTOM_ARGS = "advanced_custom_args"
+CFG_ADV_SUBS = "advanced_write_subs"
+CFG_ADV_LIMIT_RATE = "advanced_limit_rate"
+
+# ---- [新增] 高级选项默认值 ----
+ADV_DEFAULTS = {
+    CFG_ADV_EXPANDED: False,     # 默认折叠
+    CFG_ADV_PROXY: "",
+    CFG_ADV_CUSTOM_ARGS: "",
+    CFG_ADV_SUBS: False,
+    CFG_ADV_LIMIT_RATE: "",
+}
+
+# [新增] 缺失依赖时提示的 winget 安装命令（弹窗内可一键复制）
+WINGET_COMMANDS = [
+    "winget install -e --id yt-dlp.yt-dlp",
+    "winget install -e --id yt-dlp.FFmpeg",
+]
+
+# [新增] 限速取值校验：数字 + 可选单位 k/K/m/M/g/G，例如 500K、2M、1.5m、1024
+LIMIT_RATE_RE = re.compile(r"^\d+(?:\.\d+)?[kKmMgG]?$")
+
+# [新增] 附加参数里 --limit-rate 之类的"带值参数"不需要特殊处理，直接按 shell 规则切分
+ADV_HINT_WRAP_MIN = 140      # 说明标签换行宽度下限（配合 wraplength 修复）
+# [主题] 圆角半径：按钮/输入框/下拉框统一用适度圆角，复选框略小
+BUTTON_RADIUS = 8            # 按钮圆角
+INPUT_RADIUS = 8             # 输入框圆角
+COMBO_RADIUS = 8             # 下拉框圆角
+CHECK_RADIUS = 5             # 复选框圆角
+BUTTON_PAD_Y = 16            # 按钮内边距（越大按钮越"厚"，更醒目）
 
 # 日志框最多保留的行数，超出后从头部裁剪
 LOG_MAX_LINES = 4000
@@ -203,6 +280,85 @@ def app_dir():
     if getattr(sys, "frozen", False):
         return os.path.dirname(os.path.abspath(sys.executable))
     return os.path.dirname(os.path.abspath(__file__))
+
+
+# ===========================================================================
+# [新增] 外部依赖解析：程序目录便携版优先 → 系统 PATH 回退
+# ===========================================================================
+def find_local_binary(names):
+    """在程序所在目录里查找便携版可执行文件，找到返回绝对路径，否则 None。"""
+    base = app_dir()
+    for name in names:
+        cand = os.path.join(base, name)
+        if os.path.isfile(cand):
+            return cand
+    return None
+
+
+def resolve_binary(names, fallback_name):
+    """解析单个外部依赖。
+
+    返回 (可执行引用, 来源标记, 完整路径)：
+      * 程序目录里存在便携版 → (绝对路径, SOURCE_LOCAL, 绝对路径)
+      * 否则回退系统 PATH  → (裸命令名, SOURCE_PATH, which() 结果)
+      * 都没有            → (裸命令名, "", None)
+    便携版用绝对路径写进命令，用户一眼能看出跑的是本地那个；
+    PATH 版保留裸名，命令预览保持简洁可复制。
+    """
+    local = find_local_binary(names)
+    if local:
+        return local, SOURCE_LOCAL, local
+    found = shutil.which(fallback_name)
+    if found:
+        return fallback_name, SOURCE_PATH, found
+    return fallback_name, "", None
+
+
+def resolve_binaries():
+    """[新增] 启动时解析 yt-dlp / ffmpeg，把结果写到全局运行态变量里。"""
+    global YTDLP_BIN, FFMPEG_BIN
+    global YTDLP_SOURCE, FFMPEG_SOURCE
+    global YTDLP_RESOLVED_PATH, FFMPEG_RESOLVED_PATH
+    YTDLP_BIN, YTDLP_SOURCE, YTDLP_RESOLVED_PATH = resolve_binary(
+        PORTABLE_YTDLP_NAMES, "yt-dlp")
+    FFMPEG_BIN, FFMPEG_SOURCE, FFMPEG_RESOLVED_PATH = resolve_binary(
+        PORTABLE_FFMPEG_NAMES, "ffmpeg")
+    return YTDLP_RESOLVED_PATH, FFMPEG_RESOLVED_PATH
+
+
+def query_ytdlp_version(executable, timeout=15):
+    """[新增] 执行 `yt-dlp --version` 拿引擎版本号，失败返回空串。
+
+    在后台线程里调用，避免启动时卡界面。
+    """
+    if not executable:
+        return ""
+    try:
+        out = subprocess.run(
+            [executable, "--version"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            timeout=timeout, creationflags=CREATE_NO_WINDOW)
+        text = decode_output(out.stdout or b"").strip().splitlines()
+        return text[0].strip() if text else ""
+    except Exception:                                     # noqa: BLE001
+        return ""
+
+
+def dependency_source_text(source):
+    """[新增] 把来源标记渲染成界面上显示的【…】文案。"""
+    if source == SOURCE_LOCAL:
+        return f"【{SOURCE_LOCAL}】"
+    if source == SOURCE_PATH:
+        return f"【{SOURCE_PATH}】"
+    return "【未找到】"
+
+
+def set_ytdlp_version(version):
+    """[新增] 记录探测到的 yt-dlp 版本号（运行态变量，供环境自检等处使用）。"""
+    global YTDLP_VERSION
+    YTDLP_VERSION = (version or "").strip()
+    return YTDLP_VERSION
 
 
 def normalize_dir(path):
@@ -274,16 +430,25 @@ class FlatButton(tk.Canvas):
         self._hover = False
         self._pressed = False
 
+        # [主题] 主按钮加粗，视觉上更醒目；次级按钮保持常规字重
+        if kind == "primary":
+            bold = tkfont.Font(font=self._font)
+            bold.configure(weight="bold")
+            self._font = bold
+
         f = tkfont.Font(font=self._font)
         w = max(min_width, f.measure(text) + 2 * padx)
-        h = height or (f.metrics("linespace") + 12)
+        # [主题] 按钮加厚，点击区域更明显
+        h = height or (f.metrics("linespace") + BUTTON_PAD_Y)
 
         super().__init__(master, width=w, height=h, bg=bg, bd=0,
                          highlightthickness=0, relief="flat", takefocus=0,
                          cursor="hand2" if state == "normal" else "arrow")
         # 注意：不要用 self._w / self._h，那是 tkinter 内部保存控件路径名的属性
         self._bw, self._bh = w, h
-        self._shape = self._rounded(0, 0, w, h, 3, fill=self._fill())
+        # [主题] 圆角按钮 + 次级按钮补一圈细边框
+        self._shape = self._rounded(0, 0, w, h, BUTTON_RADIUS,
+                                    fill=self._fill(), outline=self._outline())
         self._label = self.create_text(w / 2, h / 2, text=text,
                                        fill=self._fg(), font=self._font)
 
@@ -300,15 +465,17 @@ class FlatButton(tk.Canvas):
             x2, y2 - r, x2, y2, x2 - r, y2, x1 + r, y2,
             x1, y2, x1, y2 - r, x1, y1 + r, x1, y1,
         ]
-        return self.create_polygon(pts, smooth=True, splinesteps=8,
-                                   outline="", **kw)
+        return self.create_polygon(pts, smooth=True, splinesteps=8, **kw)
 
     def _palette(self):
         if self._kind == "primary":
             return {"normal": C["ACCENT"], "hover": C["ACCENT_HI"],
-                    "active": C["ACCENT_LO"], "fg": "#ffffff"}
+                    "active": C["ACCENT_LO"], "fg": "#ffffff",
+                    "outline": "", "hover_outline": ""}
+        # [主题] 次级按钮：白底 + 更清晰的灰边框，悬浮时边框与文字转主色蓝
         return {"normal": C["GHOST_BG"], "hover": C["GHOST_HI"],
-                "active": "#474747", "fg": C["TEXT"]}
+                "active": C["GHOST_LO"], "fg": C["GHOST_FG"],
+                "outline": C["BORDER_HI"], "hover_outline": C["ACCENT"]}
 
     def _fill(self):
         if self._state == "disabled":
@@ -323,10 +490,23 @@ class FlatButton(tk.Canvas):
     def _fg(self):
         if self._state == "disabled":
             return C["DISABLED_FG"]
+        # [主题] 次级按钮悬浮/按下时文字变主色，反馈更明显
+        if self._kind != "primary" and (self._hover or self._pressed):
+            return C["ACCENT"]
         return self._palette()["fg"]
 
+    def _outline(self):
+        """[主题] 按钮描边色（主按钮无描边，次级按钮用细边框）。"""
+        if self._state == "disabled":
+            return C["BORDER"]
+        p = self._palette()
+        if self._kind != "primary" and self._hover:
+            return p["hover_outline"]
+        return p["outline"]
+
     def _redraw(self):
-        self.itemconfigure(self._shape, fill=self._fill())
+        self.itemconfigure(self._shape, fill=self._fill(),
+                           outline=self._outline())
         self.itemconfigure(self._label, fill=self._fg())
         self.configure(cursor="hand2" if self._state == "normal" else "arrow")
 
@@ -373,10 +553,10 @@ class FlatButton(tk.Canvas):
 # ③ 扁平复选框控件
 # ===========================================================================
 class FlatCheck(tk.Canvas):
-    """深色扁平复选框：纯色方框 + 1px 细边框，选中时填充强调蓝并画白色对勾。
+    """扁平复选框（已适配浅色主题）：圆角方框 + 1px 细边框，选中时填充主色蓝并画白色对勾。
 
-    原生 tk.Checkbutton 在 Windows 下的勾选框由系统绘制，深色主题下容易出现
-    「框是黑的、对勾也是黑的」问题，所以这里和 FlatButton 一样自绘，保证风格统一。
+    原生 tk.Checkbutton 在 Windows 下的勾选框由系统绘制，配色难以跟随主题，
+    所以这里和 FlatButton 一样自绘，保证风格统一。
     """
 
     BOX = 15          # 方框边长
@@ -404,9 +584,10 @@ class FlatCheck(tk.Canvas):
                          cursor="hand2")
         self._bw, self._bh = w, h
         top = (h - box) // 2
-        self._box = self.create_rectangle(1, top + 1, box, top + box,
-                                          outline=C["BORDER"],
-                                          fill=C["INPUT_BG"], width=1)
+        # [主题] 方框改为圆角矩形，未选中时白底 + 细边框
+        self._box = self._rounded_box(1, top + 1, box, top + box,
+                                      radius=CHECK_RADIUS, fill=C["INPUT_BG"],
+                                      outline=C["BORDER"], width=1)
         # 对勾（三段折线），选中时才显示
         self._tick = self.create_line(box * 0.24, top + box * 0.52,
                                       box * 0.44, top + box * 0.72,
@@ -423,6 +604,14 @@ class FlatCheck(tk.Canvas):
         self._redraw()
 
     # -- 绘制 -----------------------------------------------------------
+    def _rounded_box(self, x1, y1, x2, y2, radius=4, **kw):
+        """[主题] 用平滑多边形画圆角方框（浅色主题下比直角方框更柔和）。"""
+        pts = [
+            x1 + radius, y1, x2 - radius, y1, x2, y1, x2, y1 + radius,
+            x2, y2 - radius, x2, y2, x2 - radius, y2, x1 + radius, y2,
+            x1, y2, x1, y2 - radius, x1, y1 + radius, x1, y1,
+        ]
+        return self.create_polygon(pts, smooth=True, splinesteps=8, **kw)
     def get(self):
         return bool(self._var.get()) if self._var is not None else False
 
@@ -467,6 +656,204 @@ class FlatCheck(tk.Canvas):
 
 
 # ===========================================================================
+# [新增] 圆角输入框：Canvas 画圆角边框 + 内嵌 tk.Entry
+#   tkinter 原生 Entry 只能是方角，这里用"圆角外壳 + 无边框内层"的方式实现，
+#   聚焦时描边变主色蓝，对外接口（pack/bind/focus_set/get…）与 Entry 保持一致。
+# ===========================================================================
+class RoundedEntry(tk.Canvas):
+    def __init__(self, master, textvariable=None, font=None, radius=INPUT_RADIUS,
+                 height=None, padx=10, bg=None, justify="left", width=None):
+        try:
+            host_bg = bg or master.cget("bg")
+        except Exception:
+            host_bg = C["SURFACE"]
+        self._radius = radius
+        self._padx = padx
+        self._focused = False
+        f = tkfont.Font(font=font or FONTS["ui"])
+        h = height or (f.metrics("linespace") + 16)
+        w = f.measure("0") * width + 2 * padx if width else 220
+
+        super().__init__(master, width=w, height=h, bg=host_bg, bd=0,
+                         highlightthickness=0, relief="flat", takefocus=0)
+        self._entry = tk.Entry(self, textvariable=textvariable,
+                               bg=C["INPUT_BG"], fg=C["TEXT"],
+                               insertbackground=C["TEXT"], relief="flat", bd=0,
+                               font=font or FONTS["ui"], highlightthickness=0,
+                               justify=justify)
+        self._shape = self.create_polygon(
+            self._points(1, 1, w - 1, h - 1, radius), smooth=True, splinesteps=10,
+            fill=C["INPUT_BG"], outline=C["BORDER"], width=1)
+        self._win = self.create_window(padx, h // 2, window=self._entry,
+                                       anchor="w",
+                                       width=max(10, w - 2 * padx),
+                                       height=max(10, h - 14))
+        # 只把 <Configure> 绑在圆角外壳上：若同时转发给内层 Entry，
+        # 会因为"外壳改高度 → 内层改尺寸 → 又触发外壳回调"而无限收缩
+        super().bind("<Configure>", self._on_configure)
+        # 点击圆角留白区域也能聚焦到输入框
+        super().bind("<Button-1>", lambda _e: self._entry.focus_set())
+        self._entry.bind("<FocusIn>", lambda _e: self._set_focus(True))
+        self._entry.bind("<FocusOut>", lambda _e: self._set_focus(False))
+        self._entry.bind("<Enter>", lambda _e: self._redraw(hover=True))
+        self._entry.bind("<Leave>", lambda _e: self._redraw(hover=False))
+
+    def _points(self, x1, y1, x2, y2, r):
+        return [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r,
+                x2, y2 - r, x2, y2, x2 - r, y2, x1 + r, y2,
+                x1, y2, x1, y2 - r, x1, y1 + r, x1, y1]
+
+    def _set_focus(self, focused):
+        self._focused = focused
+        self._redraw()
+
+    def _redraw(self, hover=None):
+        if hover is not None:
+            self._hover = hover
+        outline = C["BORDER"]
+        if self._focused:
+            outline = C["ACCENT"]
+        elif getattr(self, "_hover", False):
+            outline = C["BORDER_HI"]
+        self.itemconfigure(self._shape, outline=outline)
+
+    def _on_configure(self, event):
+        w, h = event.width, event.height
+        self.coords(self._shape, *self._points(1, 1, w - 1, h - 1,
+                                               self._radius))
+        self.coords(self._win, self._padx, h // 2)
+        self.itemconfigure(self._win, width=max(10, w - 2 * self._padx),
+                           height=max(10, h - 14))
+
+    # -- 对外接口：转发给内层 Entry -------------------------------------
+    def bind(self, sequence=None, func=None, add=None):
+        """外部绑定（如 <Return> 触发下载）同时挂到内层 Entry 上。"""
+        result = super().bind(sequence, func, add)
+        entry = self.__dict__.get("_entry")
+        if entry is not None and func is not None:
+            entry.bind(sequence, func, add)
+        return result
+
+    def focus_set(self):
+        self._entry.focus_set()
+
+    # cget/configure/get/delete/index… 在 Canvas 上都存在同名方法，会挡住
+    # __getattr__ 的转发，所以这里逐个显式转发，保证"用起来就是一个 Entry"
+    def cget(self, key):
+        return self._entry.cget(key)
+
+    def configure(self, *args, **kwargs):
+        return self._entry.configure(*args, **kwargs)
+
+    config = configure
+
+    def get(self):
+        return self._entry.get()
+
+    def insert(self, *args):
+        return self._entry.insert(*args)
+
+    def delete(self, *args):
+        return self._entry.delete(*args)
+
+    def icursor(self, *args):
+        return self._entry.icursor(*args)
+
+    def index(self, *args):
+        return self._entry.index(*args)
+
+    def select_range(self, *args):
+        return self._entry.select_range(*args)
+
+    def __getattr__(self, name):
+        entry = self.__dict__.get("_entry")
+        if entry is not None:
+            return getattr(entry, name)
+        raise AttributeError(name)
+
+
+# ===========================================================================
+# [新增] 圆角下拉框：Canvas 圆角外壳 + 无边框 ttk.Combobox
+# ===========================================================================
+class RoundedCombo(tk.Canvas):
+    def __init__(self, master, textvariable=None, values=(), width=16,
+                 font=None, radius=COMBO_RADIUS):
+        try:
+            host_bg = bg = master.cget("bg")
+        except Exception:
+            host_bg = C["SURFACE"]
+        self._radius = radius
+        self._focused = False
+        f = tkfont.Font(font=font or FONTS["ui"])
+        w = f.measure("0") * width + 46
+        h = f.metrics("linespace") + 16
+
+        super().__init__(master, width=w, height=h, bg=host_bg, bd=0,
+                         highlightthickness=0, relief="flat", takefocus=0)
+        self._combo = ttk.Combobox(self, textvariable=textvariable,
+                                   values=values, state="readonly",
+                                   font=font or FONTS["ui"], width=width,
+                                   style="Rounded.TCombobox")
+        self._shape = self.create_polygon(
+            self._points(1, 1, w - 1, h - 1, radius), smooth=True, splinesteps=10,
+            fill=C["INPUT_BG"], outline=C["BORDER"], width=1)
+        self._win = self.create_window(8, h // 2, window=self._combo, anchor="w",
+                                       width=w - 16, height=h - 12)
+        self._combo.bind("<FocusIn>", lambda _e: self._set_focus(True))
+        self._combo.bind("<FocusOut>", lambda _e: self._set_focus(False))
+        self._combo.bind("<Enter>", lambda _e: self._redraw(hover=True))
+        self._combo.bind("<Leave>", lambda _e: self._redraw(hover=False))
+
+    def _points(self, x1, y1, x2, y2, r):
+        return [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r,
+                x2, y2 - r, x2, y2, x2 - r, y2, x1 + r, y2,
+                x1, y2, x1, y2 - r, x1, y1 + r, x1, y1]
+
+    def _set_focus(self, focused):
+        self._focused = focused
+        self._redraw()
+
+    def _redraw(self, hover=None):
+        if hover is not None:
+            self._hover = hover
+        outline = C["BORDER"]
+        if self._focused:
+            outline = C["ACCENT"]
+        elif getattr(self, "_hover", False):
+            outline = C["BORDER_HI"]
+        self.itemconfigure(self._shape, outline=outline)
+
+    # -- 对外接口：转发给内层 ttk.Combobox -------------------------------
+    # 同样要显式转发 Canvas 上已存在的同名方法
+    def bind(self, sequence=None, func=None, add=None):
+        return self._combo.bind(sequence, func, add)
+
+    def cget(self, key):
+        return self._combo.cget(key)
+
+    def configure(self, *args, **kwargs):
+        return self._combo.configure(*args, **kwargs)
+
+    config = configure
+
+    def get(self):
+        return self._combo.get()
+
+    def set(self, value):
+        return self._combo.set(value)
+
+    def current(self, *args):
+        return self._combo.current(*args)
+
+    def __getattr__(self, name):
+        """未定义的属性/方法转发给内层 ttk.Combobox（values/state…）。"""
+        combo = self.__dict__.get("_combo")
+        if combo is not None:
+            return getattr(combo, name)
+        raise AttributeError(name)
+
+
+# ===========================================================================
 # ④ 主界面
 # ===========================================================================
 class YtDlpGUI:
@@ -494,11 +881,30 @@ class YtDlpGUI:
         self.out_dir = self.saved_default or self.builtin_dir
         self.dir_var = tk.StringVar(value=self.out_dir)
 
+        # ---- [新增] 高级选项状态（从配置文件恢复，缺键时用默认值）----
+        self.cfg = self._load_config()                     # 整份配置（含未知字段）
+        self.adv_expanded = bool(self.cfg.get(CFG_ADV_EXPANDED,
+                                              ADV_DEFAULTS[CFG_ADV_EXPANDED]))
+        self.proxy_var = tk.StringVar(
+            value=str(self.cfg.get(CFG_ADV_PROXY, ADV_DEFAULTS[CFG_ADV_PROXY])))
+        self.custom_args_var = tk.StringVar(
+            value=str(self.cfg.get(CFG_ADV_CUSTOM_ARGS,
+                                   ADV_DEFAULTS[CFG_ADV_CUSTOM_ARGS])))
+        self.subs_var = tk.BooleanVar(
+            value=bool(self.cfg.get(CFG_ADV_SUBS, ADV_DEFAULTS[CFG_ADV_SUBS])))
+        self.limit_rate_var = tk.StringVar(
+            value=str(self.cfg.get(CFG_ADV_LIMIT_RATE,
+                                   ADV_DEFAULTS[CFG_ADV_LIMIT_RATE])))
+        self._save_after_id = None      # 高级选项写盘防抖句柄
+        # ---- [新增] 引擎版本（后台线程探测，不阻塞启动）----
+        self.engine_var = tk.StringVar(value="引擎版本：检测中…")
+
         self._setup_style()
         self._build_ui()
         self._bind_events()
         self.refresh_preview()
         self.check_environment()
+        self._start_version_probe()     # [新增] 异步取 yt-dlp --version
         self._after_id = self.root.after(60, self._drain_queue)
 
     # ------------------------------------------------------------------
@@ -538,16 +944,36 @@ class YtDlpGUI:
         self.root.option_add("*TCombobox*Listbox.borderWidth", "1")
         self.root.option_add("*TCombobox*Listbox.font", FONTS["ui"])
 
-        # 细滚动条
-        style.configure("Dark.Vertical.TScrollbar", background="#3a3a3a",
-                        troughcolor=C["BG"], bordercolor=C["BG"],
+        # [新增] 圆角外壳内嵌的下拉框：把自身方角边框"藏起来"，
+        # 只保留外层 Canvas 画的圆角描边（聚焦/悬浮由外壳负责变色）
+        style.configure("Rounded.TCombobox", background=C["INPUT_BG"],
+                        fieldbackground=C["INPUT_BG"], foreground=C["TEXT"],
+                        arrowcolor=C["TEXT_DIM"], bordercolor=C["INPUT_BG"],
+                        lightcolor=C["INPUT_BG"], darkcolor=C["INPUT_BG"],
+                        focuscolor=C["INPUT_BG"], padding=2, relief="flat")
+        style.map("Rounded.TCombobox",
+                  fieldbackground=[("readonly", C["INPUT_BG"])],
+                  foreground=[("readonly", C["TEXT"])],
+                  selectbackground=[("readonly", C["INPUT_BG"])],
+                  selectforeground=[("readonly", C["TEXT"])],
+                  bordercolor=[("focus", C["INPUT_BG"]),
+                               ("active", C["INPUT_BG"])],
+                  lightcolor=[("focus", C["INPUT_BG"])],
+                  darkcolor=[("focus", C["INPUT_BG"])],
+                  arrowcolor=[("active", C["ACCENT"]),
+                              ("pressed", C["ACCENT"])],
+                  background=[("active", C["INPUT_BG"])])
+
+        # 细滚动条（[主题] 浅色配色）
+        style.configure("Dark.Vertical.TScrollbar", background=C["SCROLL_BG"],
+                        troughcolor=C["TROUGH"], bordercolor=C["TROUGH"],
                         arrowcolor=C["TEXT_DIM"], relief="flat", arrowsize=12)
         style.map("Dark.Vertical.TScrollbar",
-                  background=[("active", "#4a4a4a")])
+                  background=[("active", C["SCROLL_HI"])])
 
-        # 细进度条
-        style.configure("Flat.Horizontal.TProgressbar", troughcolor="#2b2b2b",
-                        background=C["ACCENT"], bordercolor="#2b2b2b",
+        # 细进度条（[主题] 浅色槽 + 主色蓝填充）
+        style.configure("Flat.Horizontal.TProgressbar", troughcolor=C["TROUGH"],
+                        background=C["ACCENT"], bordercolor=C["TROUGH"],
                         lightcolor=C["ACCENT"], darkcolor=C["ACCENT"],
                         thickness=4)
 
@@ -576,14 +1002,9 @@ class YtDlpGUI:
         row.pack(fill="x")
         tk.Label(row, text="URL", width=10, anchor="w", bg=C["SURFACE"],
                  fg=C["TEXT"], font=FONTS["ui"]).pack(side="left")
-        self.url_entry = tk.Entry(row, textvariable=self.url_var,
-                                  bg=C["INPUT_BG"], fg=C["TEXT"],
-                                  insertbackground=C["TEXT"], relief="flat",
-                                  bd=0, font=FONTS["ui"],
-                                  highlightthickness=1,
-                                  highlightbackground=C["BORDER"],
-                                  highlightcolor=C["ACCENT"])
-        self.url_entry.pack(side="left", fill="x", expand=True, ipady=5)
+        self.url_entry = RoundedEntry(row, textvariable=self.url_var,
+                                      font=FONTS["ui"])
+        self.url_entry.pack(side="left", fill="x", expand=True)
         tk.Label(body,
                  text="例如：https://www.bilibili.com/video/BVxxxx ｜ "
                       "https://www.douyin.com/video/xxxx ｜ "
@@ -597,15 +1018,14 @@ class YtDlpGUI:
         row.pack(fill="x")
         tk.Label(row, text="清晰度", width=10, anchor="w", bg=C["SURFACE"],
                  fg=C["TEXT"], font=FONTS["ui"]).pack(side="left")
-        self.quality_box = ttk.Combobox(row, textvariable=self.quality_var,
-                                        values=[name for name, _ in QUALITY_CHOICES],
-                                        state="readonly", width=18)
+        self.quality_box = RoundedCombo(row, textvariable=self.quality_var,
+                                        values=[n for n, _ in QUALITY_CHOICES],
+                                        width=18)
         self.quality_box.pack(side="left")
         tk.Label(row, text="Cookie", width=8, anchor="w", bg=C["SURFACE"],
                  fg=C["TEXT"], font=FONTS["ui"]).pack(side="left", padx=(26, 0))
-        self.cookie_box = ttk.Combobox(row, textvariable=self.cookie_var,
-                                       values=COOKIE_CHOICES, state="readonly",
-                                       width=16)
+        self.cookie_box = RoundedCombo(row, textvariable=self.cookie_var,
+                                       values=COOKIE_CHOICES, width=16)
         self.cookie_box.pack(side="left")
 
         # 复选框：下载整个合集 / 列表（默认勾选）
@@ -640,12 +1060,77 @@ class YtDlpGUI:
         body.bind("<Configure>",
                   lambda e: self._resize_notes(e.width))
 
+        # ---- [新增] 分组 2.5：高级选项（可折叠，默认收起） ----
+        # 复用 _card()：展开/折叠仅 pack / pack_forget，不改动 _card 自身实现
+        body = self._card(main, "高级选项", action=self._adv_header_action)
+        self.adv_body = body
+
+        row = tk.Frame(body, bg=C["SURFACE"])
+        row.pack(fill="x")
+        tk.Label(row, text="代理地址", width=10, anchor="w", bg=C["SURFACE"],
+                 fg=C["TEXT"], font=FONTS["ui"]).pack(side="left")
+        self.proxy_entry = self._make_entry(row, self.proxy_var)
+        self.proxy_entry.pack(side="left", fill="x", expand=True)
+        self.adv_proxy_hint = tk.Label(
+            body, text="留空不使用代理；填写后追加 --proxy \"地址\"，"
+                       "例如 http://127.0.0.1:7890",
+            bg=C["SURFACE"], fg=C["TEXT_MUTE"], font=FONTS["small"],
+            anchor="w", justify="left", wraplength=760)
+        self.adv_proxy_hint.pack(fill="x", pady=(4, 0))
+
+        row = tk.Frame(body, bg=C["SURFACE"])
+        row.pack(fill="x", pady=(8, 0))
+        tk.Label(row, text="附加参数", width=10, anchor="w", bg=C["SURFACE"],
+                 fg=C["TEXT"], font=FONTS["ui"]).pack(side="left")
+        self.custom_args_entry = self._make_entry(row, self.custom_args_var)
+        self.custom_args_entry.pack(side="left", fill="x", expand=True)
+        self.adv_args_hint = tk.Label(
+            body, text="原样拼接到命令末尾的自定义 yt-dlp 参数，"
+                       "例如 --no-check-certificate；留空不添加",
+            bg=C["SURFACE"], fg=C["TEXT_MUTE"], font=FONTS["small"],
+            anchor="w", justify="left", wraplength=760)
+        self.adv_args_hint.pack(fill="x", pady=(4, 0))
+
+        row = tk.Frame(body, bg=C["SURFACE"])
+        row.pack(fill="x", pady=(8, 0))
+        tk.Label(row, text="下载字幕", width=10, anchor="w", bg=C["SURFACE"],
+                 fg=C["TEXT"], font=FONTS["ui"]).pack(side="left")
+        self.chk_subs = FlatCheck(row, text="同时下载字幕（含自动生成字幕）",
+                                  variable=self.subs_var,
+                                  command=self._on_advanced_changed)
+        self.chk_subs.pack(side="left")
+
+        row = tk.Frame(body, bg=C["SURFACE"])
+        row.pack(fill="x", pady=(8, 0))
+        tk.Label(row, text="限速", width=10, anchor="w", bg=C["SURFACE"],
+                 fg=C["TEXT"], font=FONTS["ui"]).pack(side="left")
+        self.limit_rate_entry = self._make_entry(row, self.limit_rate_var,
+                                                 width=14)
+        self.limit_rate_entry.pack(side="left")
+        self.adv_rate_hint = tk.Label(
+            row, text="", bg=C["SURFACE"], fg=C["TEXT_MUTE"],
+            font=FONTS["small"], anchor="w", justify="left")
+        self.adv_rate_hint.pack(side="left", padx=(10, 0))
+
+        row = tk.Frame(body, bg=C["SURFACE"])
+        row.pack(fill="x", pady=(10, 0))
+        FlatButton(row, "一键重置", self.reset_advanced, kind="ghost",
+                   height=26, padx=12, font=FONTS["small"]).pack(side="left")
+        tk.Label(row, text="清空代理 / 附加参数 / 字幕 / 限速，恢复默认状态",
+                 bg=C["SURFACE"], fg=C["TEXT_MUTE"], font=FONTS["small"],
+                 anchor="w").pack(side="left", padx=(10, 0))
+        body.bind("<Configure>", lambda e: self._resize_adv_notes(e.width))
+
+        # 恢复上次的展开状态；默认折叠（需求：启动默认收起）
+        self._apply_advanced_visibility()
+        self._update_limit_rate_hint()
+
         # ---- 分组 3：命令预览（只读） ----
         body = self._card(main, "命令预览（只读 · 实时刷新）",
                           action=lambda head: self._header_action(
                               head, "复制命令", self.copy_command))
         self.cmd_text = tk.Text(body, height=3, wrap="word",
-                                bg=C["INPUT_BG"], fg=C["CMD_FG"],
+                                bg=C["CMD_BG"], fg=C["CMD_FG"],
                                 font=FONTS["mono"], relief="flat", bd=0,
                                 padx=8, pady=6, state="disabled",
                                 cursor="arrow", highlightthickness=1,
@@ -675,6 +1160,11 @@ class YtDlpGUI:
 
         right = tk.Frame(bar, bg=C["BG"])
         right.pack(side="right")
+        # [新增] 引擎版本标签：显示 yt-dlp 版本号 + 二进制来源（便携版 / 系统PATH版）
+        self.engine_lbl = tk.Label(right, textvariable=self.engine_var,
+                                   bg=C["BG"], fg=C["TEXT_MUTE"],
+                                   font=FONTS["small"], anchor="e")
+        self.engine_lbl.pack(anchor="e")
         self.status_lbl = tk.Label(right, textvariable=self.status_var,
                                    bg=C["BG"], fg=C["TEXT_DIM"],
                                    font=FONTS["small"], anchor="e")
@@ -696,14 +1186,9 @@ class YtDlpGUI:
                  fg=C["TEXT"], font=FONTS["small"]).pack(side="left")
         # 既可以直接粘贴路径，也可以用右侧按钮选择；
         # 这个文本框的内容就是"本次下载保存到哪里"
-        self.dir_entry = tk.Entry(dirrow, textvariable=self.dir_var,
-                                  bg=C["INPUT_BG"], fg=C["TEXT"],
-                                  insertbackground=C["TEXT"], relief="flat",
-                                  bd=0, font=FONTS["small"],
-                                  highlightthickness=1,
-                                  highlightbackground=C["BORDER"],
-                                  highlightcolor=C["ACCENT"])
-        self.dir_entry.pack(side="left", fill="x", expand=True, ipady=3)
+        self.dir_entry = RoundedEntry(dirrow, textvariable=self.dir_var,
+                                      font=FONTS["small"])
+        self.dir_entry.pack(side="left", fill="x", expand=True)
         self.btn_pick = FlatButton(dirrow, "选择文件夹…", self.choose_dir,
                                    kind="ghost", height=24, padx=10,
                                    font=FONTS["small"])
@@ -728,7 +1213,7 @@ class YtDlpGUI:
                           action=lambda head: self._log_actions(head))
         wrap = tk.Frame(body, bg=C["SURFACE"])
         wrap.pack(fill="both", expand=True)
-        self.log = tk.Text(wrap, bg=C["INPUT_BG"], fg=C["LOG_FG"],
+        self.log = tk.Text(wrap, bg=C["LOG_BG"], fg=C["LOG_FG"],
                            font=FONTS["mono"], relief="flat", bd=0,
                            padx=8, pady=6, wrap="word", state="disabled",
                            highlightthickness=1,
@@ -761,26 +1246,273 @@ class YtDlpGUI:
                      "不进入合集。")
 
     def _resize_notes(self, width):
-        """卡片宽度变化时同步两个说明标签的换行宽度。"""
-        wrap = max(320, width - 20)
-        self.note_label.configure(wraplength=wrap)
-        self.pl_hint.configure(wraplength=wrap)
+        """卡片宽度变化时同步两个说明标签的换行宽度。
+
+        UI bugfix：窗口被缩到极小时，Configure 事件给出的 width 可能非常小
+        （布局中间态甚至为 0/负数），旧的 max(320, width - 20) 会算出一个与控件
+        实际可用宽度不匹配的 wraplength，说明文字因此被挤成一条竖排窄条。
+        现在改为"按真实可用宽度收敛 + 合理下限保护"。
+        """
+        try:
+            width = int(width)
+        except (TypeError, ValueError):
+            return
+        if width <= 1:                      # 布局中间态，忽略这一帧
+            return
+        avail = max(ADV_HINT_WRAP_MIN, min(width - 20, 1600))
+        self.note_label.configure(wraplength=avail)
+        self.pl_hint.configure(wraplength=avail)
+
+    def _resize_adv_notes(self, width):
+        """[新增] 高级选项卡片内说明文字的同一套换行保护。"""
+        try:
+            width = int(width)
+        except (TypeError, ValueError):
+            return
+        if width <= 1:
+            return
+        avail = max(ADV_HINT_WRAP_MIN, min(width - 20, 1600))
+        self.adv_proxy_hint.configure(wraplength=avail)
+        self.adv_args_hint.configure(wraplength=avail)
+
+    # ------------------------------------------------------------------
+    # [新增] 高级选项：输入框 / 折叠 / 参数拼装 / 持久化
+    # ------------------------------------------------------------------
+    def _make_entry(self, parent, var, font=None, width=None):
+        """生成与现有输入框同款式的圆角输入框（聚焦蓝色高亮描边）。"""
+        return RoundedEntry(parent, textvariable=var, font=font or FONTS["ui"],
+                            width=width)
+
+    def _adv_header_action(self, head):
+        """在高级选项卡片的标题栏右侧放展开/折叠按钮。"""
+        self.btn_adv_toggle = FlatButton(head, "展开 ▼", self.toggle_advanced,
+                                         kind="ghost", min_width=84, height=24,
+                                         padx=10, font=FONTS["small"])
+        self.btn_adv_toggle.pack(side="right")
+
+    def _apply_advanced_visibility(self):
+        """按 self.adv_expanded 显示 / 隐藏高级选项内容区。"""
+        if self.adv_expanded:
+            self.adv_body.pack(fill="x", padx=14, pady=(6, 8))
+            self.btn_adv_toggle.set_text("收起 ▲")
+        else:
+            self.adv_body.pack_forget()
+            self.btn_adv_toggle.set_text("展开 ▼")
+
+    def toggle_advanced(self):
+        """展开 / 折叠高级选项，并把状态记进配置文件。"""
+        self.adv_expanded = not self.adv_expanded
+        self._apply_advanced_visibility()
+        self._save_config({CFG_ADV_EXPANDED: self.adv_expanded})
+        self.refresh_preview()               # 需求：新增选项变化即刷新命令预览
+
+    def _on_advanced_changed(self):
+        """高级选项任一取值变化：刷新命令预览 + 防抖写盘。"""
+        self._update_limit_rate_hint()
+        self.refresh_preview()
+        self._schedule_config_save()
+
+    def _schedule_config_save(self):
+        """防抖：连续输入时只在停顿后写一次配置文件。"""
+        if self._save_after_id is not None:
+            try:
+                self.root.after_cancel(self._save_after_id)
+            except Exception:                        # noqa: BLE001
+                pass
+        try:
+            self._save_after_id = self.root.after(600, self._flush_advanced_config)
+        except tk.TclError:
+            self._save_after_id = None
+
+    def _flush_advanced_config(self):
+        """把高级选项的当前取值合并写回配置文件（不覆盖其它字段）。"""
+        self._save_after_id = None
+        # 窗口可能已被销毁（直接 destroy 的场景），此时不再写盘
+        try:
+            if not self.root.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        self._save_config({
+            CFG_ADV_PROXY: self.proxy_var.get().strip(),
+            CFG_ADV_CUSTOM_ARGS: self.custom_args_var.get().strip(),
+            CFG_ADV_SUBS: bool(self.subs_var.get()),
+            CFG_ADV_LIMIT_RATE: self.limit_rate_var.get().strip(),
+        })
+
+    def reset_advanced(self):
+        """一键重置：清空代理 / 附加参数 / 字幕 / 限速，恢复默认状态。"""
+        self.proxy_var.set("")
+        self.custom_args_var.set("")
+        self.subs_var.set(False)
+        self.limit_rate_var.set("")
+        self._on_advanced_changed()
+        self._flush_advanced_config()        # 立即落盘，不等待防抖
+        self._append("line", "dim", "高级选项已重置为默认状态。")
+
+    def _update_limit_rate_hint(self):
+        """限速输入校验提示：非法值给橙色提示且不追加参数。"""
+        rate = self.limit_rate_var.get().strip()
+        if not rate:
+            self.adv_rate_hint.configure(text="如 500K / 2M，留空不限速",
+                                         fg=C["TEXT_MUTE"])
+        elif LIMIT_RATE_RE.match(rate):
+            self.adv_rate_hint.configure(text=f"将追加 --limit-rate {rate}",
+                                         fg=C["OK"])
+        else:
+            self.adv_rate_hint.configure(
+                text="格式不正确（示例：500K / 1.5M），该项将被忽略",
+                fg=C["WARN"])
+
+    def _split_extra_args(self, text):
+        """拆分用户填写的附加参数，支持用引号包住带空格的值。
+
+        用 posix=False 保留 Windows 路径里的反斜杠，避免 C:\\dir 被吃掉转义符。
+        """
+        try:
+            parts = shlex.split(text, posix=False)
+        except ValueError:
+            parts = text.split()
+        out = []
+        for p in parts:
+            if len(p) >= 2 and p[0] == p[-1] and p[0] in "\"'":
+                p = p[1:-1]
+            if p:
+                out.append(p)
+        return out
+
+    def advanced_args(self):
+        """把高级选项翻译成 yt-dlp 参数；空值 / 非法值一律不追加。"""
+        args = []
+        proxy = self.proxy_var.get().strip()
+        if proxy:
+            args += ["--proxy", proxy]
+        if self.subs_var.get():
+            args += ["--write-sub", "--write-auto-sub"]
+        rate = self.limit_rate_var.get().strip()
+        if rate and LIMIT_RATE_RE.match(rate):
+            args += ["--limit-rate", rate]
+        extra = self.custom_args_var.get().strip()
+        if extra:
+            args += self._split_extra_args(extra)
+        return args
+
+    def _start_version_probe(self):
+        """[新增] 后台线程执行 yt-dlp --version，结果经队列回主线程显示。"""
+        def work():
+            version = query_ytdlp_version(YTDLP_RESOLVED_PATH or YTDLP_BIN)
+            self.q.put(("engine", version))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _apply_engine_version(self, version):
+        """把引擎版本 + 二进制来源写到状态区标签上。"""
+        set_ytdlp_version(version)
+        src = dependency_source_text(YTDLP_SOURCE)
+        if version:
+            self.engine_var.set(f"引擎 yt-dlp {version} · {src}")
+            self.engine_lbl.configure(fg=C["TEXT_MUTE"])
+            self._append("line", "dim", f"引擎版本：yt-dlp {version} {src}")
+        else:
+            self.engine_var.set(f"引擎版本未知 · {src}")
+            self.engine_lbl.configure(fg=C["WARN"])
+            self._append("line", "warn",
+                         "未能获取 yt-dlp 版本号，请确认依赖可用。")
+
+    def _binary_available(self, binary):
+        """判断解析出的二进制是否可用：绝对路径看文件，裸命令名看 PATH。"""
+        if not binary:
+            return False
+        if os.path.isabs(binary) or os.sep in binary:
+            return os.path.isfile(binary)
+        return shutil.which(binary) is not None
+
+    def _show_missing_deps_dialog(self, missing):
+        """[新增] 缺失依赖引导弹窗：给出可一键复制的 winget 安装命令。
+
+        说明：messagebox 无法承载"可复制"的交互，所以这里用 Toplevel 自绘一个
+        同主题的小弹窗；若创建失败则回退到原来的 messagebox 提示。
+        """
+        names = "、".join(missing)
+        try:
+            win = tk.Toplevel(self.root)
+            win.title("缺少依赖")
+            win.configure(bg=C["BG"])
+            win.transient(self.root)
+            win.resizable(False, False)
+
+            box = tk.Frame(win, bg=C["SURFACE"], highlightthickness=1,
+                           highlightbackground=C["BORDER"])
+            box.pack(fill="both", expand=True, padx=16, pady=16)
+
+            tk.Label(box, text=f"未检测到：{names}", bg=C["SURFACE"],
+                     fg=C["ERR"], font=FONTS["card"], anchor="w").pack(
+                fill="x", padx=16, pady=(14, 4))
+            tk.Label(box,
+                     text="请在 PowerShell 中执行下面的命令安装（点击「复制命令」"
+                          "后粘贴即可），安装完成后重启本程序：",
+                     bg=C["SURFACE"], fg=C["TEXT_DIM"], font=FONTS["small"],
+                     anchor="w", justify="left",
+                     wraplength=460).pack(fill="x", padx=16)
+
+            cmd_text = tk.Text(box, height=len(WINGET_COMMANDS) + 1, width=52,
+                               bg=C["CMD_BG"], fg=C["CMD_FG"],
+                               font=FONTS["mono"], relief="flat", bd=0,
+                               padx=10, pady=8, wrap="none")
+            cmd_text.insert("1.0", "\n".join(WINGET_COMMANDS))
+            cmd_text.configure(state="disabled")
+            cmd_text.pack(fill="x", padx=16, pady=(8, 4))
+
+            btns = tk.Frame(box, bg=C["SURFACE"])
+            btns.pack(fill="x", padx=16, pady=(4, 14))
+
+            def copy_cmds():
+                self.root.clipboard_clear()
+                self.root.clipboard_append("\n".join(WINGET_COMMANDS))
+                self._append("line", "dim", "winget 安装命令已复制到剪贴板。")
+
+            FlatButton(btns, "复制命令", copy_cmds, kind="primary",
+                       min_width=100, height=28,
+                       font=FONTS["small"]).pack(side="left")
+            FlatButton(btns, "关闭", win.destroy, kind="ghost",
+                       min_width=80, height=28,
+                       font=FONTS["small"]).pack(side="left", padx=(8, 0))
+
+            win.update_idletasks()
+            x = self.root.winfo_rootx() + max(
+                0, (self.root.winfo_width() - win.winfo_width()) // 2)
+            y = self.root.winfo_rooty() + 120
+            win.geometry(f"+{x}+{y}")
+            try:
+                win.grab_set()               # 模态，避免误操作
+            except tk.TclError:
+                pass
+            self._append("line", "err",
+                         f"缺少依赖：{names}。请按弹窗中的 winget 命令安装后重启。")
+        except tk.TclError:
+            # 回退：任何异常情况下仍然给出带命令的 messagebox 提示
+            messagebox.showerror(
+                "缺少依赖",
+                f"未检测到：{names}\n\n请在 PowerShell 中执行：\n"
+                + "\n".join(WINGET_COMMANDS)
+                + "\n\n安装完成后重启本程序。", parent=self.root)
 
     def _card(self, parent, title, action=None, expand=False):
         """创建一个 Win10 设置风格的分组卡片，返回可放置内容的内层 Frame。"""
         card = tk.Frame(parent, bg=C["SURFACE"], bd=0,
                         highlightthickness=1, highlightbackground=C["BORDER"])
+        # [主题] 按钮/控件加高后纵向空间紧张，卡片内外边距适当收紧，
+        # 把省下来的高度让给下方的运行日志区
         card.pack(fill="both" if expand else "x", expand=expand,
-                  pady=(0, 9))
+                  pady=(0, 7))
         head = tk.Frame(card, bg=C["SURFACE"])
-        head.pack(fill="x", padx=14, pady=(9, 0))
+        head.pack(fill="x", padx=14, pady=(7, 0))
         tk.Label(head, text=title, bg=C["SURFACE"], fg=C["TEXT"],
                  font=FONTS["card"], anchor="w").pack(side="left")
         if action:
             action(head)
         body = tk.Frame(card, bg=C["SURFACE"])
         body.pack(fill="both" if expand else "x", expand=expand,
-                  padx=14, pady=(7, 10))
+                  padx=14, pady=(6, 8))
         return body
 
     def _header_action(self, head, text, command):
@@ -804,6 +1536,13 @@ class YtDlpGUI:
         self.playlist_var.trace_add("write", lambda *_: self._on_playlist_toggle())
         # 保存位置变化 → 刷新 -P 参数与按钮可用状态
         self.dir_var.trace_add("write", lambda *_: self._on_dir_changed())
+        # [新增] 高级选项任一取值变化 → 刷新命令预览 + 记忆到配置文件
+        self.proxy_var.trace_add("write", lambda *_: self._on_advanced_changed())
+        self.custom_args_var.trace_add("write",
+                                       lambda *_: self._on_advanced_changed())
+        self.subs_var.trace_add("write", lambda *_: self._on_advanced_changed())
+        self.limit_rate_var.trace_add("write",
+                                      lambda *_: self._on_advanced_changed())
         # 回车即开始下载
         self.url_entry.bind("<Return>", lambda _e: self.start_download())
 
@@ -830,6 +1569,8 @@ class YtDlpGUI:
         browser = BROWSER_MAP.get(self.cookie_var.get())
         if browser:
             cmd += ["--cookies-from-browser", browser]
+        # [新增] 高级选项：代理 / 字幕 / 限速 / 自定义附加参数（空值不追加）
+        cmd += self.advanced_args()
         # 输出目录 + 文件名模板
         cmd += ["-P", self.out_dir, "-o", OUTPUT_TEMPLATE]
         url = self.url_var.get().strip()
@@ -849,24 +1590,32 @@ class YtDlpGUI:
     # 环境自检
     # ------------------------------------------------------------------
     def check_environment(self):
-        ytdlp_path = shutil.which(YTDLP_BIN)
-        ffmpeg_path = shutil.which(FFMPEG_BIN)
+        # [新增] 依赖路径以 runtime 解析结果为准（便携版优先 / PATH 回退）
+        ytdlp_path = YTDLP_RESOLVED_PATH
+        ffmpeg_path = FFMPEG_RESOLVED_PATH
         parts, bad = [], []
+        # [新增] 标注来源：【本地便携版】/【系统PATH版本】，并用颜色区分状态
         if ytdlp_path:
-            parts.append(f"yt-dlp ✓  {ytdlp_path}")
+            parts.append(f"yt-dlp ✓{dependency_source_text(YTDLP_SOURCE)}  "
+                         f"{ytdlp_path}")
         else:
-            parts.append("yt-dlp ✗  未在 PATH 中找到")
+            parts.append("yt-dlp ✗  未找到（本地目录与系统 PATH 都没有）")
             bad.append("yt-dlp")
         if ffmpeg_path:
-            parts.append(f"ffmpeg ✓  {ffmpeg_path}")
+            parts.append(f"ffmpeg ✓{dependency_source_text(FFMPEG_SOURCE)}  "
+                         f"{ffmpeg_path}")
         else:
-            parts.append("ffmpeg ✗  未在 PATH 中找到")
+            parts.append("ffmpeg ✗  未找到（本地目录与系统 PATH 都没有）")
             bad.append("ffmpeg")
         self.env_label.configure(text="依赖检查：" + "    ".join(parts),
                                  fg=C["ERR"] if bad else C["OK"])
         self._append("line", "dim",
-                     f"依赖检查：yt-dlp={ytdlp_path or '未找到'} | "
-                     f"ffmpeg={ffmpeg_path or '未找到'}")
+                     f"依赖检查：yt-dlp={ytdlp_path or '未找到'}"
+                     f"{dependency_source_text(YTDLP_SOURCE)} | "
+                     f"ffmpeg={ffmpeg_path or '未找到'}"
+                     f"{dependency_source_text(FFMPEG_SOURCE)}")
+        self._append("line", "dim", f"程序目录：{self.builtin_dir}"
+                                   "（便携版 yt-dlp.exe / ffmpeg.exe 放这里即被优先使用）")
         # 保存位置自检：配置里记住的目录没了（换机器 / 拔了移动盘）就回退
         if self.saved_default and not self._ensure_dir(self.saved_default,
                                                        quiet=True):
@@ -879,9 +1628,9 @@ class YtDlpGUI:
                else "内置默认（源码运行=脚本目录，exe 运行=exe 所在目录）")
         self._append("line", "dim", f"保存位置：{self.out_dir}    [{src}]")
         if bad:
-            self._append("line", "err",
+            self._append("line", "warn",
                          "缺少依赖：" + "、".join(bad) +
-                         "。请先安装并确保已加入系统 PATH，再重新打开本程序。")
+                         "。点「开始下载」会给出 winget 安装命令。")
 
     # ------------------------------------------------------------------
     # 下载流程
@@ -900,12 +1649,15 @@ class YtDlpGUI:
                                    parent=self.root)
             self.url_entry.focus_set()
             return
-        if shutil.which(YTDLP_BIN) is None:
-            messagebox.showerror(
-                "未找到 yt-dlp",
-                "系统 PATH 中找不到 yt-dlp。\n\n"
-                "请先安装 yt-dlp 并确保可以从命令行直接运行 yt-dlp --version，"
-                "然后重新打开本程序。", parent=self.root)
+        if not self._binary_available(YTDLP_BIN) or \
+                not self._binary_available(FFMPEG_BIN):
+            # [新增] 依赖缺失：弹窗给出可复制的 winget 安装命令
+            missing = []
+            if not self._binary_available(YTDLP_BIN):
+                missing.append("yt-dlp")
+            if not self._binary_available(FFMPEG_BIN):
+                missing.append("ffmpeg")
+            self._show_missing_deps_dialog(missing)
             return
         # 保存位置：不存在就创建，创建不了就别启动子进程了
         if not self._ensure_dir(self.out_dir):
@@ -1025,6 +1777,8 @@ class YtDlpGUI:
                 elif kind == "fatal":
                     self._append("line", "err", item[1])
                     self._on_finished(-1)
+                elif kind == "engine":            # [新增] yt-dlp 版本探测回填
+                    self._apply_engine_version(item[1])
         except queue.Empty:
             pass
         finally:
@@ -1207,17 +1961,42 @@ class YtDlpGUI:
         except (OSError, ValueError, AttributeError):
             return None
 
-    def _write_default(self, path):
-        """把默认保存位置写入配置文件，返回是否写成功。"""
+    def _load_config(self):
+        """[新增] 读取整份配置（容错：文件缺失 / 损坏 / 非对象一律返回空 dict）。
+
+        读取用 utf-8-sig，容忍老配置或被记事本加过 BOM 的文件。
+        """
+        try:
+            with open(self._config_path(), "r", encoding="utf-8-sig") as fh:
+                data = json.load(fh)
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _save_config(self, updates=None, remove=()):
+        """[新增] 合并写回配置：先读旧内容，只覆盖 updates 里的键、按 remove 删键，
+        其余字段（包括本程序不认识的字段）原样保留，绝不整体覆盖。
+
+        需求：新增配置项追加写入，不破坏旧版 ytdlp-gui.config.json 的读取。
+        """
+        data = self._load_config()
+        for key in remove:
+            data.pop(key, None)
+        if updates:
+            data.update(updates)
         try:
             with open(self._config_path(), "w", encoding="utf-8") as fh:
-                json.dump({"default_output_dir": path}, fh,
-                          ensure_ascii=False, indent=2)
+                json.dump(data, fh, ensure_ascii=False, indent=2)
+            self.cfg = data
             return True
         except OSError as exc:
             self._append("line", "warn",
                          f"配置文件写入失败（设置仅在本次运行内有效）：{exc}")
             return False
+
+    def _write_default(self, path):
+        """把默认保存位置写入配置文件（合并写，保留高级选项等其它字段）。"""
+        return self._save_config({CFG_DEFAULT_DIR: path})
 
     def _ensure_dir(self, path, quiet=False):
         """确保目录存在（不存在就创建）。quiet=True 时不弹错误框。"""
@@ -1281,12 +2060,21 @@ class YtDlpGUI:
                      + ("" if ok else "（配置文件未能写入，重启后不生效）"))
 
     def reset_default(self):
-        """清除记住的默认位置，回到内置默认（脚本 / exe 所在目录）。"""
+        """清除记住的默认位置，回到内置默认（脚本 / exe 所在目录）。
+
+        [新增] 只删除 default_output_dir 这一个键，保留高级选项等其它配置。
+        """
         self.saved_default = None
-        try:
-            os.remove(self._config_path())
-        except OSError:
-            pass
+        remaining = self._load_config()
+        remaining.pop(CFG_DEFAULT_DIR, None)
+        if remaining:
+            self._save_config(remove=[CFG_DEFAULT_DIR])
+        else:
+            # 配置里没有别的字段了，直接删文件，保持目录干净
+            try:
+                os.remove(self._config_path())
+            except OSError:
+                pass
         self.dir_var.set(self.builtin_dir)
         self._append("line", "dim",
                      f"已恢复内置默认保存位置：{self.builtin_dir}")
@@ -1331,6 +2119,13 @@ class YtDlpGUI:
             except Exception:                        # noqa: BLE001
                 pass
             self._after_id = None
+        # [新增] 高级选项写盘防抖定时器同样要取消，否则关窗后 Tk 会报错
+        if self._save_after_id is not None:
+            try:
+                self.root.after_cancel(self._save_after_id)
+            except Exception:                        # noqa: BLE001
+                pass
+            self._save_after_id = None
         self.root.destroy()
 
 
@@ -1387,7 +2182,9 @@ def apply_window_geometry(root):
     screen_w = root.winfo_screenwidth()
     screen_h = root.winfo_screenheight()
     w = min(int(1000 * scale), int(screen_w * 0.95))
-    h = min(int(770 * scale), int(screen_h * 0.90))
+    # [主题] 按钮加高后占用更多纵向空间，窗口基准高度与上限都适当放宽，
+    # 保证日志区仍然有足够的可视高度
+    h = min(int(800 * scale), int(screen_h * 0.92))
     x = max(0, (screen_w - w) // 2)
     y = max(0, (screen_h - h) // 3)
     root.geometry(f"{w}x{h}+{x}+{y}")
@@ -1398,6 +2195,7 @@ def apply_window_geometry(root):
 
 def main():
     enable_dpi_awareness()          # 必须先于 tk.Tk()，否则屏幕尺寸会被虚拟化
+    resolve_binaries()              # [新增] 解析便携版优先 / PATH 回退的二进制
     root = tk.Tk()
     root.withdraw()                 # 先隐藏，等尺寸算好再显示，避免闪烁
     pick_fonts(root)

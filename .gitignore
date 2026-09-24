@@ -7,3 +7,4 @@ __pycache__/
 cookies.txt
 *.tmp
 .env
+node_modules/
