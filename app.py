@@ -60,9 +60,16 @@ Twitch、微博……）本工具都可以直接使用。
         限速，以及一键重置；展开状态与各项取值都会记忆到配置文件
     14. 引擎版本：启动时后台执行 yt-dlp --version，把版本号和二进制来源显示在
         状态区域（区分便携版 / 系统 PATH 版）
+    15. 视频预览：点「预览」解析当前链接（不下载），在独立窗口里显示封面缩略图 +
+        标题 / 平台 / 作者 / 时长 / 上传日期 / 播放量 / 点赞数 / 简介 /
+        可选清晰度 / 网页链接，支持一键复制信息或用浏览器打开
 
 关键实现
 --------
+    * 预览取数：后台线程跑 yt-dlp --dump-json --playlist-items 1，复用界面上的
+      Cookie / 代理 / 附加参数设置，受限内容也能解析；结果经既有队列回主线程
+    * 封面显示：Tk 的 PhotoImage 只认 PNG/GIF，而封面多为 jpg/webp，
+      因此借用系统里已有的 ffmpeg 走管道转成 PNG（不落临时文件、不引入 Pillow）
     * 默认基础参数：-f "bv*+ba" --add-header Referer:https://www.bilibili.com
       （「清晰度」选最高画质时输出与原始需求完全一致）
     * 二进制解析：resolve_binaries() 在启动时决定 YTDLP_BIN / FFMPEG_BIN
@@ -96,6 +103,7 @@ Twitch、微博……）本工具都可以直接使用。
       依然会被优先识别）。
 """
 
+import base64
 import json
 import locale
 import os
@@ -105,10 +113,12 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import tkinter as tk
 import tkinter.font as tkfont
+import urllib.request
 from tkinter import filedialog, messagebox, ttk
 
 # ===========================================================================
@@ -116,7 +126,7 @@ from tkinter import filedialog, messagebox, ttk
 # ===========================================================================
 
 APP_TITLE = "全平台视频下载器 · yt-dlp GUI"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 
 # 外部依赖的可执行文件名
 #   [新增] 这两个全局量改为"运行时动态赋值"：启动时由 resolve_binaries()
@@ -242,6 +252,24 @@ COMBO_RADIUS = 8             # 下拉框圆角
 CHECK_RADIUS = 5             # 复选框圆角
 BUTTON_PAD_Y = 16            # 按钮内边距（越大按钮越"厚"，更醒目）
 
+# ---- [新增] 视频预览（解析视频信息，不下载）----
+PREVIEW_TIMEOUT = 90         # 解析超时（秒）
+THUMB_MAX_W = 360            # 封面图最大宽度（像素）
+PREVIEW_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+              "AppleWebKit/537.36 (KHTML, like Gecko) "
+              "Chrome/120.0 Safari/537.36")
+# 预览窗口里展示的字段：(显示名, info 里的候选键)
+PREVIEW_FIELDS = [
+    ("标题", ("title", "fulltitle")),
+    ("平台", ("extractor_key", "extractor")),
+    ("作者", ("uploader", "channel", "creator", "uploader_id")),
+    ("时长", ("duration_string", "duration")),
+    ("上传日期", ("upload_date", "release_date")),
+    ("播放量", ("view_count",)),
+    ("点赞数", ("like_count",)),
+    ("简介", ("description",)),
+]
+
 # 日志框最多保留的行数，超出后从头部裁剪
 LOG_MAX_LINES = 4000
 LOG_KEEP_LINES = 3000
@@ -359,6 +387,107 @@ def set_ytdlp_version(version):
     global YTDLP_VERSION
     YTDLP_VERSION = (version or "").strip()
     return YTDLP_VERSION
+
+
+# ===========================================================================
+# [新增] 视频预览用到的格式化 / 抓图工具
+# ===========================================================================
+def format_duration(value):
+    """秒数 -> 03:32 / 1:02:03 ；非法值原样返回字符串。"""
+    if value in (None, ""):
+        return ""
+    try:
+        total = int(float(value))
+    except (TypeError, ValueError):
+        return str(value)
+    if total < 0:
+        return ""
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+
+def format_upload_date(value):
+    """YYYYMMDD -> YYYY-MM-DD。"""
+    text = str(value or "").strip()
+    if len(text) == 8 and text.isdigit():
+        return f"{text[:4]}-{text[4:6]}-{text[6:]}"
+    return text
+
+
+def format_count(value):
+    """播放量之类的数字加千分位；非数字原样返回。"""
+    if value in (None, ""):
+        return ""
+    try:
+        return f"{int(value):,}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def format_quality_list(info, limit=8):
+    """从 formats 里汇总可用清晰度，例如 '1080P / 720P / 480P / 360P'。"""
+    heights = set()
+    for fmt in info.get("formats") or []:
+        if not isinstance(fmt, dict):
+            continue
+        h = fmt.get("height")
+        if isinstance(h, (int, float)) and h > 0:
+            heights.add(int(h))
+    if not heights:
+        single = info.get("height")
+        if isinstance(single, (int, float)) and single > 0:
+            heights.add(int(single))
+    if not heights:
+        return ""
+    ordered = sorted(heights, reverse=True)[:limit]
+    return " / ".join(f"{h}P" for h in ordered)
+
+
+def first_field(info, keys, default=""):
+    """按候选键顺序取第一个非空值。"""
+    for key in keys:
+        value = info.get(key)
+        if value not in (None, "", []):
+            return value
+    return default
+
+
+def fetch_thumbnail_png(url, headers=None, max_width=THUMB_MAX_W,
+                        timeout=30):
+    """[新增] 下载封面并转成 PNG 字节（Tk 的 PhotoImage 不认 jpg/webp）。
+
+    返回 (png_bytes 或 None, 错误说明)。
+    转换借用系统里已有的 ffmpeg，走管道不产生临时文件；本来就是 PNG 则直接用。
+    """
+    if not url:
+        return None, ""
+    try:
+        req = urllib.request.Request(url, headers=headers or
+                                     {"User-Agent": PREVIEW_UA})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read()
+    except Exception as exc:                              # noqa: BLE001
+        return None, f"封面下载失败：{exc}"
+    if not raw:
+        return None, "封面为空"
+    if raw[:8] == b"\x89PNG\r\n\x1a\n":
+        return raw, ""
+    try:
+        out = subprocess.run(
+            [FFMPEG_BIN, "-hide_banner", "-loglevel", "error",
+             "-i", "pipe:0", "-vf", f"scale={max_width}:-2",
+             "-f", "image2pipe", "-vcodec", "png", "pipe:1"],
+            input=raw, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=timeout, creationflags=CREATE_NO_WINDOW)
+    except FileNotFoundError:
+        return None, "未找到 ffmpeg，无法显示封面"
+    except Exception as exc:                              # noqa: BLE001
+        return None, f"封面转码失败：{exc}"
+    if out.returncode == 0 and (out.stdout or b"")[:8] == b"\x89PNG\r\n\x1a\n":
+        return out.stdout, ""
+    err = decode_output(out.stderr or b"").strip().splitlines()
+    return None, ("封面转码失败：" + (err[-1] if err else "未知错误"))
 
 
 def normalize_dir(path):
@@ -898,6 +1027,11 @@ class YtDlpGUI:
         self._save_after_id = None      # 高级选项写盘防抖句柄
         # ---- [新增] 引擎版本（后台线程探测，不阻塞启动）----
         self.engine_var = tk.StringVar(value="引擎版本：检测中…")
+        # ---- [新增] 视频预览状态 ----
+        self.previewing = False         # 是否正在解析
+        self._preview_win = None        # 预览窗口（复用同一个）
+        self._preview_img = None        # 封面 PhotoImage 引用（防止被回收）
+        self._preview_info = None       # 最近一次解析结果
 
         self._setup_style()
         self._build_ui()
@@ -1151,6 +1285,10 @@ class YtDlpGUI:
         self.btn_download = FlatButton(left, "开始下载", self.start_download,
                                        kind="primary", min_width=110)
         self.btn_download.pack(side="left")
+        # [新增] 预览按钮：解析视频信息（不下载）
+        self.btn_preview = FlatButton(left, "预览", self.start_preview,
+                                      kind="ghost", min_width=84)
+        self.btn_preview.pack(side="left", padx=(8, 0))
         self.btn_stop = FlatButton(left, "停止", self.stop_download,
                                    kind="ghost", min_width=70, state="disabled")
         self.btn_stop.pack(side="left", padx=(8, 0))
@@ -1779,6 +1917,8 @@ class YtDlpGUI:
                     self._on_finished(-1)
                 elif kind == "engine":            # [新增] yt-dlp 版本探测回填
                     self._apply_engine_version(item[1])
+                elif kind == "preview":           # [新增] 视频预览解析结果
+                    self._on_preview_result(item[1], item[2])
         except queue.Empty:
             pass
         finally:
@@ -1911,12 +2051,321 @@ class YtDlpGUI:
         self.btn_download.set_state("disabled" if busy else "normal")
         self.btn_stop.set_state("normal" if busy else "disabled")
         self.btn_download.set_text("下载中…" if busy else "开始下载")
+        # [新增] 下载期间也把「预览」一并禁用，避免同时跑两个 yt-dlp 进程
+        self._update_preview_button()
         if busy:
             self._set_status("下载中…", C["ACCENT_HI"])
 
     def _set_status(self, text, color):
         self.status_var.set(text)
         self.status_lbl.configure(fg=color)
+
+    # ------------------------------------------------------------------
+    # [新增] 视频预览：解析链接信息 + 封面，不产生下载
+    # ------------------------------------------------------------------
+    def _update_preview_button(self):
+        """预览按钮的可用状态与文案（下载中或解析中均禁用）。"""
+        busy = self.busy or self.previewing
+        self.btn_preview.set_state("disabled" if busy else "normal")
+        self.btn_preview.set_text("解析中…" if self.previewing else "预览")
+
+    def start_preview(self):
+        """点击「预览」：后台解析当前链接的视频信息。"""
+        if self.previewing:
+            return
+        url = self.url_var.get().strip()
+        if not url:
+            messagebox.showwarning("缺少链接", "请先粘贴视频链接。",
+                                   parent=self.root)
+            self.url_entry.focus_set()
+            return
+        if not url.lower().startswith(("http://", "https://")):
+            messagebox.showwarning("链接格式有误",
+                                   "请粘贴以 http:// 或 https:// 开头的视频网页链接。",
+                                   parent=self.root)
+            self.url_entry.focus_set()
+            return
+        if not self._binary_available(YTDLP_BIN):
+            self._show_missing_deps_dialog(["yt-dlp"])
+            return
+        self.previewing = True
+        self._update_preview_button()
+        self._set_status("解析中…", C["ACCENT_HI"])
+        self._append("line", "dim", f"正在解析视频信息：{url}")
+        # 注意：Tk 变量不是线程安全的，必须在主线程先把界面状态取成普通 Python 值，
+        # 再交给后台线程（否则后台线程调用 xxx_var.get() 会报
+        # "main thread is not in main loop"）
+        options = {
+            "browser": BROWSER_MAP.get(self.cookie_var.get()),
+            "proxy": self.proxy_var.get().strip(),
+            "extra": self.custom_args_var.get().strip(),
+        }
+        threading.Thread(target=self._preview_worker, args=(url, options),
+                         daemon=True).start()
+
+    def _preview_worker(self, url, options):
+        """后台线程：yt-dlp --dump-json 取信息，再抓封面转 PNG。
+
+        options 是主线程预先取好的界面设置（Cookie / 代理 / 附加参数），
+        本线程内不再触碰任何 Tk 控件。
+        """
+        cmd = [YTDLP_BIN, "--dump-json", "--no-warnings", "--playlist-items", "1"]
+        # 复用界面上的 Cookie / 代理 / 附加参数设置，受限内容也能解析
+        if options.get("browser"):
+            cmd += ["--cookies-from-browser", options["browser"]]
+        if options.get("proxy"):
+            cmd += ["--proxy", options["proxy"]]
+        if options.get("extra"):
+            cmd += self._split_extra_args(options["extra"])
+        cmd.append(url)
+
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "utf-8"
+        env["PYTHONUTF8"] = "1"
+        try:
+            out = subprocess.run(
+                cmd, stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                timeout=PREVIEW_TIMEOUT, env=env,
+                creationflags=CREATE_NO_WINDOW)
+        except FileNotFoundError:
+            self.q.put(("preview", None, f"未找到可执行文件：{cmd[0]}"))
+            return
+        except subprocess.TimeoutExpired:
+            self.q.put(("preview", None,
+                        f"解析超时（{PREVIEW_TIMEOUT} 秒），请检查网络或代理设置。"))
+            return
+        except OSError as exc:
+            self.q.put(("preview", None, f"启动解析进程失败：{exc}"))
+            return
+
+        info = None
+        for line in decode_output(out.stdout or b"").splitlines():
+            line = line.strip()
+            if line.startswith("{"):
+                try:
+                    info = json.loads(line)
+                    break
+                except ValueError:
+                    continue
+        if not isinstance(info, dict):
+            errs = [ln for ln in decode_output(out.stderr or b"").splitlines()
+                    if ln.strip()]
+            reason = errs[-1].strip() if errs else "未获取到视频信息"
+            self.q.put(("preview", None, reason))
+            return
+
+        png, thumb_err = self._load_thumbnail(info)
+        self.q.put(("preview", {"info": info, "png": png, "thumb_err": thumb_err},
+                    ""))
+        return
+
+    def _load_thumbnail(self, info):
+        """取封面地址并转成 PNG 字节。"""
+        url = info.get("thumbnail")
+        if not url:
+            thumbs = info.get("thumbnails") or []
+            if thumbs and isinstance(thumbs[-1], dict):
+                url = thumbs[-1].get("url")
+        if not url:
+            return None, ""
+        headers = {"User-Agent": PREVIEW_UA}
+        for key, value in (info.get("http_headers") or {}).items():
+            if value:
+                headers[key] = value
+        return fetch_thumbnail_png(url, headers)
+
+    def _on_preview_result(self, payload, error):
+        """主线程：解析结束，刷新按钮状态并弹出/刷新预览窗口。"""
+        self.previewing = False
+        self._update_preview_button()
+        self._set_status("就绪", C["TEXT_DIM"])
+        if not payload:
+            self._append("line", "err", f"✗ 解析失败：{error}")
+            messagebox.showerror("解析失败", error or "未知错误", parent=self.root)
+            return
+        info = payload.get("info") or {}
+        self._preview_info = info
+        title = first_field(info, ("title", "fulltitle"), "(无标题)")
+        self._append("line", "ok", f"✓ 解析成功：{title}")
+        if payload.get("thumb_err"):
+            self._append("line", "warn", payload["thumb_err"])
+        self._show_preview_window(info, payload.get("png"))
+
+    def _show_preview_window(self, info, png):
+        """[新增] 同主题的预览窗口：左边封面，右边信息，可复制。"""
+        win = getattr(self, "_preview_win", None)
+        try:
+            alive = win is not None and win.winfo_exists()
+        except tk.TclError:
+            alive = False
+        if alive:
+            for child in win.winfo_children():     # 复用窗口，原地刷新
+                child.destroy()
+        else:
+            win = tk.Toplevel(self.root)
+            self._preview_win = win
+            win.title("视频预览")
+            win.configure(bg=C["BG"])
+            win.transient(self.root)
+
+        card = tk.Frame(win, bg=C["SURFACE"], highlightthickness=1,
+                        highlightbackground=C["BORDER"])
+        card.pack(fill="both", expand=True, padx=14, pady=14)
+
+        head = tk.Frame(card, bg=C["SURFACE"])
+        head.pack(fill="x", padx=14, pady=(10, 0))
+        tk.Label(head, text="视频预览", bg=C["SURFACE"], fg=C["TEXT"],
+                 font=FONTS["card"], anchor="w").pack(side="left")
+
+        body = tk.Frame(card, bg=C["SURFACE"])
+        body.pack(fill="both", expand=True, padx=14, pady=(8, 10))
+
+        # ---- 左：封面 ----
+        cover = tk.Frame(body, bg=C["SURFACE"])
+        cover.pack(side="left", anchor="n")
+        image = None
+        if png:
+            image = self._make_photo(png)
+        self._preview_img = image       # 保持引用，避免被 GC 掉
+        if image is not None:
+            holder = tk.Label(cover, image=image, bg=C["SURFACE"],
+                              highlightthickness=1,
+                              highlightbackground=C["BORDER"], bd=0)
+        else:
+            holder = tk.Label(cover, text="（无封面）", bg=C["LOG_BG"],
+                              fg=C["TEXT_MUTE"], font=FONTS["small"],
+                              width=30, height=10,
+                              highlightthickness=1,
+                              highlightbackground=C["BORDER"])
+        holder.pack()
+
+        # ---- 右：信息 ----
+        panel = tk.Frame(body, bg=C["SURFACE"])
+        panel.pack(side="left", fill="both", expand=True, padx=(16, 0))
+
+        rows = []
+        for label, keys in PREVIEW_FIELDS:
+            value = first_field(info, keys)
+            if label == "时长":
+                value = format_duration(value) or value
+            elif label == "上传日期":
+                value = format_upload_date(value)
+            elif label in ("播放量", "点赞数"):
+                value = format_count(value)
+            elif label == "简介":
+                value = str(value).strip().replace("\n", " ")
+                if len(value) > 120:
+                    value = value[:120] + "…"
+            if value in (None, ""):
+                continue
+            rows.append((label, str(value)))
+        qualities = format_quality_list(info)
+        if qualities:
+            rows.append(("可选清晰度", qualities))
+        webpage = first_field(info, ("webpage_url", "original_url"))
+        if webpage:
+            rows.append(("网页链接", str(webpage)))
+
+        for label, value in rows:
+            row = tk.Frame(panel, bg=C["SURFACE"])
+            row.pack(fill="x", pady=1)
+            tk.Label(row, text=f"{label}", bg=C["SURFACE"], fg=C["TEXT_DIM"],
+                     font=FONTS["small"], width=9, anchor="nw").pack(side="left")
+            tk.Label(row, text=value, bg=C["SURFACE"], fg=C["TEXT"],
+                     font=FONTS["small"], anchor="w", justify="left",
+                     wraplength=430).pack(side="left", fill="x", expand=True)
+
+        btns = tk.Frame(card, bg=C["SURFACE"])
+        btns.pack(fill="x", padx=14, pady=(0, 12))
+        FlatButton(btns, "复制信息", lambda: self._copy_preview_info(info),
+                   kind="primary", min_width=100, height=30,
+                   font=FONTS["small"]).pack(side="left")
+        FlatButton(btns, "用浏览器打开",
+                   lambda: self._open_preview_url(info),
+                   kind="ghost", min_width=110, height=30,
+                   font=FONTS["small"]).pack(side="left", padx=(8, 0))
+        FlatButton(btns, "关闭", self._close_preview_window, kind="ghost",
+                   min_width=80, height=30,
+                   font=FONTS["small"]).pack(side="right")
+
+        win.update_idletasks()
+        w = max(620, win.winfo_reqwidth())
+        h = max(320, win.winfo_reqheight())
+        x = self.root.winfo_rootx() + max(
+            0, (self.root.winfo_width() - w) // 2)
+        y = self.root.winfo_rooty() + 60
+        win.geometry(f"{w}x{h}+{x}+{y}")
+
+    def _make_photo(self, png):
+        """[新增] PNG 字节 -> PhotoImage；data= 失败时退回临时文件加载。"""
+        try:
+            return tk.PhotoImage(data=base64.b64encode(png).decode("ascii"))
+        except tk.TclError:
+            pass
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as fh:
+                fh.write(png)
+                path = fh.name
+            image = tk.PhotoImage(file=path)
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            return image
+        except Exception:                                 # noqa: BLE001
+            return None
+
+    def _preview_text(self, info):
+        """把解析结果整理成可复制的文本。"""
+        lines = []
+        for label, keys in PREVIEW_FIELDS:
+            value = first_field(info, keys)
+            if label == "时长":
+                value = format_duration(value) or value
+            elif label == "上传日期":
+                value = format_upload_date(value)
+            elif label in ("播放量", "点赞数"):
+                value = format_count(value)
+            if value in (None, ""):
+                continue
+            lines.append(f"{label}：{value}")
+        qualities = format_quality_list(info)
+        if qualities:
+            lines.append(f"可选清晰度：{qualities}")
+        webpage = first_field(info, ("webpage_url", "original_url"))
+        if webpage:
+            lines.append(f"网页链接：{webpage}")
+        return "\n".join(lines)
+
+    def _copy_preview_info(self, info):
+        self.root.clipboard_clear()
+        self.root.clipboard_append(self._preview_text(info))
+        self._append("line", "dim", "视频信息已复制到剪贴板。")
+
+    def _open_preview_url(self, info):
+        url = first_field(info, ("webpage_url", "original_url"))
+        if not url:
+            return
+        try:
+            if os.name == "nt":
+                os.startfile(url)                        # noqa: S606
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", url])
+            else:
+                subprocess.Popen(["xdg-open", url])
+        except Exception as exc:                          # noqa: BLE001
+            messagebox.showerror("无法打开链接", str(exc), parent=self.root)
+
+    def _close_preview_window(self):
+        win = getattr(self, "_preview_win", None)
+        self._preview_win = None
+        self._preview_img = None
+        if win is not None:
+            try:
+                win.destroy()
+            except tk.TclError:
+                pass
 
     # ------------------------------------------------------------------
     # 小工具按钮
